@@ -1,0 +1,2 @@
+[workspace]
+members = ["rkvm-server", "rkvm-protocol", "rkvm-client"]
