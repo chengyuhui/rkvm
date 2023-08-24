@@ -10,16 +10,16 @@ use nix::{ioctl_write_int_bad, request_code_write};
 use rkvm_protocol::Packet;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::hash::{Hash, Hasher};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::{fs::OpenOptionsExt, io::OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
+use std::sync::Mutex;
 
 use libc::{O_RDONLY, O_RDWR, O_WRONLY};
 
 mod server;
+mod xclip;
 
 // https://github.com/torvalds/linux/blob/68e77ffbfd06ae3ef8f2abf1c3b971383c866983/include/uapi/linux/input.h#L186
 ioctl_write_int_bad!(eviocgrab, request_code_write!('E', 0x90, 4));
@@ -28,7 +28,7 @@ lazy_static::lazy_static! {
     static ref DEVICES: Mutex<HashMap<PathBuf, RawFd>> = Mutex::new(HashMap::new());
 }
 
-static CLIPBOARD_HASH: AtomicU64 = AtomicU64::new(0);
+static CLIPBOARD_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 
 struct Interface;
 
@@ -81,39 +81,47 @@ fn grab_devices(grab: bool) {
     }
 }
 
-fn get_clipboard_content(event_tx: tokio::sync::mpsc::Sender<Packet>) -> anyhow::Result<()> {
-    let mut clipboard = arboard::Clipboard::new()?;
-
-    match clipboard.get_text() {
-        Ok(t) => {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            t.hash(&mut hasher);
-
-            let hash = hasher.finish();
-            let old_hash = CLIPBOARD_HASH.swap(hash, std::sync::atomic::Ordering::SeqCst);
-
-            if old_hash == hash {
-                return Ok(());
-            }
-
-            let _ = event_tx.blocking_send(Packet {
-                id: 0,
-                event: rkvm_protocol::Event::TextClipboard { content: t },
-            });
+async fn get_clipboard_content(event_tx: tokio::sync::mpsc::Sender<Packet>) -> anyhow::Result<()> {
+    let timestamp = xclip::get_xclip_timestamp().await?;
+    if let Some(ts) = timestamp {
+        if CLIPBOARD_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed) == ts {
             return Ok(());
         }
-        Err(arboard::Error::ContentNotAvailable) => {}
-        Err(e) => return Err(e.into()),
+        CLIPBOARD_TIMESTAMP.store(ts, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // match clipboard.get_image() {
-    //     Ok(img) => {
-    //         // log::info!("Image clipboard: {:?}", img);
-    //         return Ok(());
-    //     }
-    //     Err(arboard::Error::ContentNotAvailable) => {}
-    //     Err(e) => return Err(e.into()),
-    // }
+    let content = if let Some(c) = xclip::get_xclip_clipboard().await? {
+        c
+    } else {
+        return Ok(());
+    };
+
+    match content {
+        xclip::ClipboardType::PngImage(img) => {
+            let _ = event_tx
+                .send(Packet {
+                    id: 0,
+                    event: rkvm_protocol::Event::ImageClipboard { png: img },
+                })
+                .await;
+        }
+        xclip::ClipboardType::Utf8Text(text) => {
+            let _ = event_tx
+                .send(Packet {
+                    id: 0,
+                    event: rkvm_protocol::Event::TextClipboard { content: text },
+                })
+                .await;
+        }
+        xclip::ClipboardType::HtmlText { html, plain } => {
+            let _ = event_tx
+                .send(Packet {
+                    id: 0,
+                    event: rkvm_protocol::Event::HtmlClipboard { html, plain },
+                })
+                .await;
+        }
+    }
 
     Ok(())
 }
@@ -215,8 +223,8 @@ fn main() -> anyhow::Result<()> {
 
                                 // Send clipboard to client
                                 let event_tx = event_tx.clone();
-                                tokio_rt.spawn_blocking(|| {
-                                    if let Err(e) = get_clipboard_content(event_tx) {
+                                tokio_rt.spawn(async move {
+                                    if let Err(e) = get_clipboard_content(event_tx).await {
                                         log::error!("Failed to send clipboard: {}", e);
                                     }
                                 });

@@ -1,11 +1,11 @@
-use arboard::Clipboard;
-use enigo::{Enigo, KeyboardControllable, MouseControllable};
 use anyhow::Result;
+use arboard::{Clipboard, ImageData};
+use enigo::{Enigo, KeyboardControllable, MouseControllable};
+use keycode::KeyMap;
 use tokio::{
     io::{AsyncReadExt, BufReader},
     net::ToSocketAddrs,
 };
-use keycode::KeyMap;
 
 #[cfg(target_os = "windows")]
 fn convert_keycode(code: u16) -> Option<u16> {
@@ -33,7 +33,7 @@ fn move_mouse_relative(_enigo: &mut Enigo, dx: i32, dy: i32) {
         Foundation::POINT,
         UI::{
             Input::KeyboardAndMouse,
-            WindowsAndMessaging::{GetCursorPos, SetCursorPos},
+            WindowsAndMessaging::{GetCursorPos, GetSystemMetrics, SetCursorPos},
         },
     };
 
@@ -43,14 +43,25 @@ fn move_mouse_relative(_enigo: &mut Enigo, dx: i32, dy: i32) {
         return;
     }
 
-    if let Err(e) = unsafe { SetCursorPos(current_pos.x + dx, current_pos.y + dy).ok() } {
+    dbg!(current_pos);
+
+    let new_x = current_pos.x + dx;
+    let new_y = current_pos.y + dy;
+
+    if let Err(e) = unsafe { SetCursorPos(new_x, new_y).ok() } {
         log::error!("Failed to set cursor position: {}", e);
     }
 
+    // let virtual_desktop_w =
+    //     unsafe { GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN) };
+    // let virtual_desktop_h =
+    //     unsafe { GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN) };
+
     // let mut mouse_input = KeyboardAndMouse::INPUT_0::default();
-    // mouse_input.mi.dx = dx;
-    // mouse_input.mi.dy = dy;
-    // mouse_input.mi.dwFlags = KeyboardAndMouse::MOUSEEVENTF_MOVE; // Relative to current position
+    // mouse_input.mi.dx = (new_x * 65535) / virtual_desktop_w;
+    // mouse_input.mi.dy = (new_y * 65535) / virtual_desktop_h;
+    // mouse_input.mi.dwFlags =
+    //     KeyboardAndMouse::MOUSEEVENTF_MOVE | KeyboardAndMouse::MOUSEEVENTF_ABSOLUTE;
 
     // let input = KeyboardAndMouse::INPUT {
     //     r#type: KeyboardAndMouse::INPUT_MOUSE,
@@ -161,6 +172,36 @@ where
             rkvm_protocol::Event::TextClipboard { content } => {
                 if let Some(c) = &mut clipboard {
                     if let Err(e) = c.set_text(content) {
+                        log::error!("Failed to set clipboard: {}", e);
+                    }
+                }
+            }
+            rkvm_protocol::Event::HtmlClipboard { html, plain } => {
+                if let Some(c) = &mut clipboard {
+                    if let Err(e) = c.set_html(html, Some(plain)) {
+                        log::error!("Failed to set clipboard: {}", e);
+                    }
+                }
+            }
+            rkvm_protocol::Event::ImageClipboard { png } => {
+                let png_image = match image::load_from_memory(&png) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        log::error!("Failed to decode clipboard image: {}", e);
+                        continue;
+                    }
+                };
+
+                let rgba8 = png_image.into_rgba8();
+                let (width, height) = rgba8.dimensions();
+                let data = rgba8.into_raw();
+
+                if let Some(c) = &mut clipboard {
+                    if let Err(e) = c.set_image(ImageData {
+                        width: width as usize,
+                        height: height as usize,
+                        bytes: std::borrow::Cow::Owned(data),
+                    }) {
                         log::error!("Failed to set clipboard: {}", e);
                     }
                 }

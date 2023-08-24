@@ -29,6 +29,13 @@ pub enum Event {
     },
     TextClipboard {
         content: String,
+    },
+    HtmlClipboard {
+        html: String,
+        plain: String,
+    },
+    ImageClipboard {
+        png: Vec<u8>,
     }
 }
 
