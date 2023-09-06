@@ -37,43 +37,22 @@ fn move_mouse_relative(_enigo: &mut Enigo, dx: i32, dy: i32) {
         },
     };
 
-    let mut current_pos = POINT { x: 0, y: 0 };
-    if let Err(e) = unsafe { GetCursorPos(&mut current_pos).ok() } {
-        log::error!("Failed to get cursor position: {}", e);
-        return;
+    let mut mouse_input = KeyboardAndMouse::INPUT_0::default();
+    mouse_input.mi.dx = dx;
+    mouse_input.mi.dy = dy;
+    mouse_input.mi.dwFlags = KeyboardAndMouse::MOUSEEVENTF_MOVE;
+
+    let input = KeyboardAndMouse::INPUT {
+        r#type: KeyboardAndMouse::INPUT_MOUSE,
+        Anonymous: mouse_input,
+    };
+
+    unsafe {
+        KeyboardAndMouse::SendInput(
+            &[input],
+            std::mem::size_of::<KeyboardAndMouse::INPUT>() as i32,
+        );
     }
-
-    dbg!(current_pos);
-
-    let new_x = current_pos.x + dx;
-    let new_y = current_pos.y + dy;
-
-    if let Err(e) = unsafe { SetCursorPos(new_x, new_y).ok() } {
-        log::error!("Failed to set cursor position: {}", e);
-    }
-
-    // let virtual_desktop_w =
-    //     unsafe { GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN) };
-    // let virtual_desktop_h =
-    //     unsafe { GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN) };
-
-    // let mut mouse_input = KeyboardAndMouse::INPUT_0::default();
-    // mouse_input.mi.dx = (new_x * 65535) / virtual_desktop_w;
-    // mouse_input.mi.dy = (new_y * 65535) / virtual_desktop_h;
-    // mouse_input.mi.dwFlags =
-    //     KeyboardAndMouse::MOUSEEVENTF_MOVE | KeyboardAndMouse::MOUSEEVENTF_ABSOLUTE;
-
-    // let input = KeyboardAndMouse::INPUT {
-    //     r#type: KeyboardAndMouse::INPUT_MOUSE,
-    //     Anonymous: mouse_input,
-    // };
-
-    // unsafe {
-    //     KeyboardAndMouse::SendInput(
-    //         &[input],
-    //         std::mem::size_of::<KeyboardAndMouse::INPUT>() as i32,
-    //     );
-    // }
 }
 
 #[cfg(not(target_os = "windows"))]

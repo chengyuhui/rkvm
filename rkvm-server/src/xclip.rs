@@ -1,5 +1,7 @@
 use anyhow::Result;
 
+use crate::ClipboardType;
+
 async fn xclip_get(target: &str) -> Result<Vec<u8>> {
     let output = tokio::process::Command::new("xclip")
         .arg("-selection")
@@ -73,9 +75,3 @@ pub async fn get_xclip_clipboard() -> Result<Option<ClipboardType>> {
     Ok(None)
 }
 
-#[derive(Debug, Hash)]
-pub enum ClipboardType {
-    PngImage(Vec<u8>),
-    Utf8Text(String),
-    HtmlText { html: String, plain: String },
-}

@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use input::event::keyboard::KeyboardEventTrait;
 use input::event::pointer::{Axis, PointerScrollEvent};
 use input::event::tablet_pad::KeyState;
@@ -10,6 +10,7 @@ use nix::{ioctl_write_int_bad, request_code_write};
 use rkvm_protocol::Packet;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::{fs::OpenOptionsExt, io::OwnedFd};
 use std::path::{Path, PathBuf};
@@ -18,7 +19,15 @@ use std::sync::Mutex;
 
 use libc::{O_RDONLY, O_RDWR, O_WRONLY};
 
+#[derive(Debug, Hash)]
+pub enum ClipboardType {
+    PngImage(Vec<u8>),
+    Utf8Text(String),
+    HtmlText { html: String, plain: String },
+}
+
 mod server;
+mod wayland;
 mod xclip;
 
 // https://github.com/torvalds/linux/blob/68e77ffbfd06ae3ef8f2abf1c3b971383c866983/include/uapi/linux/input.h#L186
@@ -81,23 +90,48 @@ fn grab_devices(grab: bool) {
     }
 }
 
-async fn get_clipboard_content(event_tx: tokio::sync::mpsc::Sender<Packet>) -> anyhow::Result<()> {
-    let timestamp = xclip::get_xclip_timestamp().await?;
-    if let Some(ts) = timestamp {
-        if CLIPBOARD_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed) == ts {
-            return Ok(());
-        }
-        CLIPBOARD_TIMESTAMP.store(ts, std::sync::atomic::Ordering::Relaxed);
-    }
+async fn get_clipboard_content(
+    event_tx: tokio::sync::mpsc::Sender<Packet>,
+    mode: ClipboardMode,
+) -> anyhow::Result<()> {
+    let content = match mode {
+        ClipboardMode::X11 => {
+            let timestamp = xclip::get_xclip_timestamp().await?;
+            if let Some(ts) = timestamp {
+                if CLIPBOARD_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed) == ts {
+                    return Ok(());
+                }
+                CLIPBOARD_TIMESTAMP.store(ts, std::sync::atomic::Ordering::Relaxed);
+            }
 
-    let content = if let Some(c) = xclip::get_xclip_clipboard().await? {
-        c
-    } else {
-        return Ok(());
+            if let Some(c) = xclip::get_xclip_clipboard().await? {
+                c
+            } else {
+                return Ok(());
+            }
+        }
+        ClipboardMode::Wayland => {
+            let content = if let Some(c) = wayland::get_wayland_clipboard().await? {
+                c
+            } else {
+                return Ok(());
+            };
+
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            content.hash(&mut hasher);
+            let hash = hasher.finish();
+
+            if CLIPBOARD_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed) == hash {
+                return Ok(());
+            }
+            CLIPBOARD_TIMESTAMP.store(hash, std::sync::atomic::Ordering::Relaxed);
+
+            content
+        }
     };
 
     match content {
-        xclip::ClipboardType::PngImage(img) => {
+        ClipboardType::PngImage(img) => {
             let _ = event_tx
                 .send(Packet {
                     id: 0,
@@ -105,7 +139,7 @@ async fn get_clipboard_content(event_tx: tokio::sync::mpsc::Sender<Packet>) -> a
                 })
                 .await;
         }
-        xclip::ClipboardType::Utf8Text(text) => {
+        ClipboardType::Utf8Text(text) => {
             let _ = event_tx
                 .send(Packet {
                     id: 0,
@@ -113,7 +147,7 @@ async fn get_clipboard_content(event_tx: tokio::sync::mpsc::Sender<Packet>) -> a
                 })
                 .await;
         }
-        xclip::ClipboardType::HtmlText { html, plain } => {
+        ClipboardType::HtmlText { html, plain } => {
             let _ = event_tx
                 .send(Packet {
                     id: 0,
@@ -126,12 +160,21 @@ async fn get_clipboard_content(event_tx: tokio::sync::mpsc::Sender<Packet>) -> a
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ClipboardMode {
+    X11,
+    Wayland,
+}
+
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
+
+    #[arg(short, long)]
+    clipboard_mode: Option<ClipboardMode>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -147,7 +190,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut grabbed = false;
 
-    let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Packet>(20);
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel::<Packet>(128);
 
     let tokio_rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -221,13 +264,16 @@ fn main() -> anyhow::Result<()> {
                                 grabbed = true;
                                 log::info!("Grabbed all devices");
 
-                                // Send clipboard to client
-                                let event_tx = event_tx.clone();
-                                tokio_rt.spawn(async move {
-                                    if let Err(e) = get_clipboard_content(event_tx).await {
-                                        log::error!("Failed to send clipboard: {}", e);
-                                    }
-                                });
+                                if let Some(mode) = args.clipboard_mode {
+                                    // Send clipboard to client
+                                    let event_tx = event_tx.clone();
+                                    tokio_rt.spawn(async move {
+                                        if let Err(e) = get_clipboard_content(event_tx, mode).await
+                                        {
+                                            log::error!("Failed to send clipboard: {}", e);
+                                        }
+                                    });
+                                }
                             }
                         }
 
@@ -247,8 +293,8 @@ fn main() -> anyhow::Result<()> {
 
                     match ev {
                         input::event::PointerEvent::Motion(ev) => {
-                            mouse_dx += ev.dx();
-                            mouse_dy += ev.dy();
+                            mouse_dx += ev.dx_unaccelerated();
+                            mouse_dy += ev.dy_unaccelerated();
 
                             if mouse_dx.abs() > 1.0 || mouse_dy.abs() > 1.0 {
                                 let dx = mouse_dx as i32;
