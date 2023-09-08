@@ -6,16 +6,13 @@ use input::event::EventTrait;
 use input::{Libinput, LibinputInterface};
 use keycode::{KeyMap, KeyMappingId};
 use nix::poll::{PollFd, PollFlags};
-use nix::{ioctl_write_int_bad, request_code_write};
 use rkvm_protocol::Packet;
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::{fs::OpenOptionsExt, io::OwnedFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::AtomicU64;
-use std::sync::Mutex;
 
 use libc::{O_RDONLY, O_RDWR, O_WRONLY};
 
@@ -26,16 +23,10 @@ pub enum ClipboardType {
     HtmlText { html: String, plain: String },
 }
 
+mod grab;
 mod server;
 mod wayland;
 mod xclip;
-
-// https://github.com/torvalds/linux/blob/68e77ffbfd06ae3ef8f2abf1c3b971383c866983/include/uapi/linux/input.h#L186
-ioctl_write_int_bad!(eviocgrab, request_code_write!('E', 0x90, 4));
-
-lazy_static::lazy_static! {
-    static ref DEVICES: Mutex<HashMap<PathBuf, RawFd>> = Mutex::new(HashMap::new());
-}
 
 static CLIPBOARD_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 
@@ -57,36 +48,14 @@ impl LibinputInterface for Interface {
                 err.raw_os_error().unwrap_or_default()
             })?;
 
-        DEVICES
-            .lock()
-            .unwrap()
-            .insert(path.to_path_buf(), fd.as_raw_fd());
+        grab::add_device(path, fd.as_raw_fd());
 
         Ok(fd)
     }
 
     fn close_restricted(&mut self, fd: OwnedFd) {
-        DEVICES.lock().unwrap().retain(|_, v| *v != fd.as_raw_fd());
-
+        grab::remove_device(fd.as_raw_fd());
         let _ = File::from(fd);
-    }
-}
-
-fn grab_devices(grab: bool) {
-    let devices = DEVICES.lock().unwrap();
-
-    for (path, device) in devices.iter() {
-        match unsafe { eviocgrab(*device, grab.into()) } {
-            Ok(_) => {}
-            Err(e) => {
-                log::error!(
-                    "Failed to {} {}: {}",
-                    if grab { "grab" } else { "ungrab" },
-                    path.display(),
-                    e
-                );
-            }
-        }
     }
 }
 
@@ -180,13 +149,13 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let mut logger = simple_logger::SimpleLogger::new();
+    let mut logger_builder = tracing_subscriber::fmt::SubscriberBuilder::default();
     if args.verbose {
-        logger = logger.with_level(log::LevelFilter::Trace);
+        logger_builder = logger_builder.with_max_level(tracing::Level::TRACE);
     } else {
-        logger = logger.with_level(log::LevelFilter::Info);
+        logger_builder = logger_builder.with_max_level(tracing::Level::INFO);
     }
-    logger.init()?;
+    logger_builder.init();
 
     let mut grabbed = false;
 
@@ -256,11 +225,11 @@ fn main() -> anyhow::Result<()> {
                     if keymap.id == KeyMappingId::ControlRight {
                         if state == KeyState::Released {
                             if grabbed {
-                                grab_devices(false);
+                                grab::grab_devices(false);
                                 grabbed = false;
                                 log::info!("Ungrabbed all devices");
                             } else {
-                                grab_devices(true);
+                                grab::grab_devices(true);
                                 grabbed = true;
                                 log::info!("Grabbed all devices");
 

@@ -1,2 +1,2 @@
 [workspace]
-members = ["rkvm-server", "rkvm-protocol", "rkvm-client"]
+members = ["rkvm-server", "rkvm-protocol", "rkvm-client", "windows-clipboard-files"]

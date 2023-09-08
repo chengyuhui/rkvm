@@ -3,12 +3,12 @@
     windows_subsystem = "windows"
 )]
 
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::Result;
 use clap::Parser;
-use enigo::Enigo;
 
+use quinn::Endpoint;
 use serde::Deserialize;
 use tao::{
     event::StartCause,
@@ -56,13 +56,16 @@ struct Args {
     verbose: bool,
 }
 
-async fn tokio_main(config: Config) {
-    let mut enigo = Enigo::new();
+async fn tokio_main(config: Config) -> Result<()> {
+    let remote_addr = SocketAddr::new(config.address.parse()?, config.port);
+
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+    endpoint.set_default_client_config(client::configure_client());
 
     let mut sleep_secs = 1;
 
     loop {
-        if let Err(e) = client::connect((config.address.as_str(), config.port), &mut enigo).await {
+        if let Err(e) = client::connect(&endpoint, remote_addr).await {
             log::error!("Error handling connection: {}", e);
         }
 
@@ -100,7 +103,11 @@ fn main() -> Result<()> {
         .build()
         .unwrap();
     tokio_rt.spawn(async move {
-        tokio_main(config).await;
+        if let Err(e) = tokio_main(config).await {
+            log::error!("Error in tokio_main: {}", e);
+
+            std::process::exit(1);
+        }
     });
 
     let event_loop = EventLoop::new();
@@ -135,13 +142,6 @@ fn main() -> Result<()> {
                     *control_flow = ControlFlow::Exit;
                 }
             }
-            // tao::event::Event::TrayEvent {
-            //     id,
-            //     bounds,
-            //     event,
-            //     position,
-            //     ..
-            // } => {}
             _ => {}
         }
     });

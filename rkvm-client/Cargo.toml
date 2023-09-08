@@ -22,6 +22,8 @@ toml = "0.7.4"
 
 tao = { version = "0.20.0", features = ["tray"] }
 image = { version = "0.24.6", default-features = false, features = ["png"] }
+quinn = "0.10.2"
+rustls = { version = "0.21.7", features = ["dangerous_configuration"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.48", features = [

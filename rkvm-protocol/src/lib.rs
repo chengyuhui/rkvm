@@ -7,6 +7,13 @@ pub enum MouseButton {
     Right,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    Mouse,
+    Keyboard,
+    Misc,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub enum Event {
     /// In pixels
@@ -36,12 +43,22 @@ pub enum Event {
     },
     ImageClipboard {
         png: Vec<u8>,
-    }
+    },
 }
 
 impl Event {
     pub fn is_high_freq(&self) -> bool {
         matches!(self, Event::MouseMotion { .. } | Event::MouseWheel { .. })
+    }
+
+    pub fn kind(&self) -> EventKind {
+        match self {
+            Event::MouseMotion { .. } | Event::MouseWheel { .. } | Event::MouseButton { .. } => {
+                EventKind::Mouse
+            }
+            Event::Keyboard { .. } => EventKind::Keyboard,
+            _ => EventKind::Misc,
+        }
     }
 }
 

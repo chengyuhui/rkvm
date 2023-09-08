@@ -1,11 +1,11 @@
+use std::{net::SocketAddr, sync::Arc};
+
 use anyhow::Result;
 use arboard::{Clipboard, ImageData};
 use enigo::{Enigo, KeyboardControllable, MouseControllable};
 use keycode::KeyMap;
-use tokio::{
-    io::{AsyncReadExt, BufReader},
-    net::ToSocketAddrs,
-};
+use quinn::{ClientConfig, Endpoint, TransportConfig};
+use tokio::io::{AsyncReadExt, BufReader};
 
 #[cfg(target_os = "windows")]
 fn convert_keycode(code: u16) -> Option<u16> {
@@ -60,16 +60,8 @@ fn move_mouse_relative(enigo: &mut Enigo, dx: i32, dy: i32) {
     enigo.mouse_move_relative(dx, dy);
 }
 
-pub async fn connect<A>(remote_addr: A, enigo: &mut Enigo) -> Result<()>
-where
-    A: ToSocketAddrs + std::fmt::Debug,
-{
-    log::info!("Connecting to {:?}", remote_addr);
-
-    let stream = tokio::net::TcpStream::connect(remote_addr).await?;
-    let mut stream = BufReader::new(stream);
-
-    log::info!("Connection established");
+async fn handle_stream(stream: quinn::RecvStream) -> Result<()> {
+    let mut enigo = Enigo::new();
 
     let mut clipboard = match Clipboard::new() {
         Ok(c) => Some(c),
@@ -78,6 +70,8 @@ where
             None
         }
     };
+
+    let mut stream = BufReader::new(stream);
 
     let mut buf = vec![0u8; 128];
 
@@ -96,7 +90,7 @@ where
 
         match packet.event {
             rkvm_protocol::Event::MouseMotion { dx, dy } => {
-                move_mouse_relative(enigo, dx, dy);
+                move_mouse_relative(&mut enigo, dx, dy);
             }
             rkvm_protocol::Event::MouseWheel { dx, dy } => {
                 if dx != 0 {
@@ -187,4 +181,77 @@ where
             }
         }
     }
+}
+
+pub async fn connect(endpoint: &Endpoint, remote_addr: SocketAddr) -> Result<()> {
+    log::info!("Connecting to {:?}", remote_addr);
+
+    let connection = endpoint.connect(remote_addr, "localhost")?.await?;
+    log::info!("Connection established");
+
+    let conn1 = connection.clone();
+    tokio::spawn(async move {
+        loop {
+            match conn1.accept_uni().await {
+                Ok(stream) => {
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_stream(stream).await {
+                            log::error!("Error handling stream: {}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    log::error!("Error accepting stream: {}", e);
+                    break;
+                }
+            }
+        }
+
+        conn1.close(0u32.into(), b"Accept failed");
+    });
+
+    let reason = connection.closed().await;
+    log::info!("Connection closed: {:?}", reason);
+
+    Ok(())
+}
+
+/// Dummy certificate verifier that treats any certificate as valid.
+/// NOTE, such verification is vulnerable to MITM attacks, but convenient for testing.
+struct SkipServerVerification;
+
+impl SkipServerVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self)
+    }
+}
+
+impl rustls::client::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
+    }
+}
+
+pub fn configure_client() -> ClientConfig {
+    let crypto = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_custom_certificate_verifier(SkipServerVerification::new())
+        .with_no_client_auth();
+
+    let mut transport = TransportConfig::default();
+    transport.max_idle_timeout(Some(std::time::Duration::from_secs(10).try_into().unwrap()));
+    
+
+    let mut config = ClientConfig::new(Arc::new(crypto));
+    config.transport_config(Arc::new(transport));
+
+    config
 }
